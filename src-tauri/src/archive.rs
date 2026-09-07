@@ -989,25 +989,70 @@ pub fn parse_subtitle_cues(path: &Path) -> Vec<Cue> {
         cues.push(Cue { start, end, text: body });
     }
 
+    // The rolling-display collapse.
+    //
+    // `last_full` is the PREVIOUS CUE'S OWN TEXT, which is not the same thing
+    // as the last line pushed to `cleaned`. Comparing against the pushed line
+    // is the obvious version and it is wrong:
+    //
+    //     cue 1  "the load in a span"
+    //     cue 2  "the load in a span goes to the tower"
+    //     cue 3  "the load in a span goes to the tower which is why it is thin"
+    //
+    // cue 2 pushes the tail "goes to the tower". cue 3 shares no prefix with
+    // THAT, so it is emitted whole and the duplication this exists to remove
+    // comes back on the third line -- and on every line after it, which in a
+    // real auto-caption file is most of the transcript. The test below only
+    // missed it because its third cue was a fresh sentence rather than another
+    // continuation.
+    enum Step {
+        ExtendPrevious,
+        PushTail(String),
+        PushWhole,
+    }
+
     let mut cleaned: Vec<Cue> = Vec::new();
+    let mut last_full: Option<String> = None;
+
     for cue in cues {
-        if let Some(prev) = cleaned.last_mut() {
-            if cue.text == prev.text {
-                prev.end = prev.end.max(cue.end);
-                continue;
-            }
-            // The auto-caption case: this cue is the previous one plus a tail.
-            if cue.text.starts_with(&prev.text) && prev.text.chars().count() > 12 {
-                let tail = cue.text[prev.text.len()..].trim().to_string();
-                if tail.is_empty() {
-                    prev.end = prev.end.max(cue.end);
+        let step = match last_full.as_deref() {
+            Some(prev_full) if !cleaned.is_empty() => {
+                if cue.text == prev_full {
+                    Step::ExtendPrevious
+                } else if cue.text.starts_with(prev_full) && prev_full.chars().count() > 12 {
+                    // A prefix match means the boundary is a char boundary, so
+                    // the byte slice is safe.
+                    let tail = cue.text[prev_full.len()..].trim();
+                    if tail.is_empty() {
+                        Step::ExtendPrevious
+                    } else {
+                        Step::PushTail(tail.to_string())
+                    }
                 } else {
-                    cleaned.push(Cue { start: cue.start, end: cue.end, text: tail });
+                    Step::PushWhole
                 }
-                continue;
             }
+            _ => Step::PushWhole,
+        };
+
+        match step {
+            Step::ExtendPrevious => {
+                if let Some(last) = cleaned.last_mut() {
+                    last.end = last.end.max(cue.end);
+                }
+            }
+            Step::PushTail(tail) => cleaned.push(Cue {
+                start: cue.start,
+                end: cue.end,
+                text: tail,
+            }),
+            Step::PushWhole => cleaned.push(Cue {
+                start: cue.start,
+                end: cue.end,
+                text: cue.text.clone(),
+            }),
         }
-        cleaned.push(cue);
+        last_full = Some(cue.text);
     }
     cleaned
 }
@@ -1313,14 +1358,25 @@ mod tests {
             "WEBVTT\n\n\
              00:00:00.000 --> 00:00:02.400\nthe load in a span\n\n\
              00:00:02.400 --> 00:00:05.100\nthe load in a span goes to the tower\n\n\
-             00:00:05.100 --> 00:00:08.000\nwhich is why it is thin\n",
+             00:00:05.100 --> 00:00:08.000\nthe load in a span goes to the tower which is why it is thin\n\n\
+             00:00:08.000 --> 00:00:10.000\nand not much else\n",
         );
 
         let cues = parse_subtitle_cues(&vtt);
-        assert_eq!(cues.len(), 3);
+        assert_eq!(cues.len(), 4);
         assert_eq!(cues[0].text, "the load in a span");
         assert_eq!(cues[1].text, "goes to the tower", "the repeated prefix must be collapsed");
-        assert_eq!(cues[2].text, "which is why it is thin");
+        // THE THIRD ROLLING LINE. The version of this test that shipped ended
+        // at cue 2 and then used a fresh sentence, so it never exercised a
+        // second continuation -- which is the case the collapse got wrong.
+        // Comparing each cue against the last EMITTED line rather than the
+        // previous cue's full text makes this one come back undedupl.
+        assert_eq!(
+            cues[2].text, "which is why it is thin",
+            "a second continuation must collapse against the previous CUE, \
+             not against the tail that was emitted for it"
+        );
+        assert_eq!(cues[3].text, "and not much else");
     }
 
     // --- Archive layout 2 conformance -------------------------------------
